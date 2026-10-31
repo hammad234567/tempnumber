@@ -43,6 +43,7 @@ private class SavedStore(context: Context) {
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val store = SavedStore(app)
+    private var inboxCountryKey = ""
 
     var screen by mutableStateOf<Screen>(Screen.Splash)
         private set
@@ -62,6 +63,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun go(s: Screen) {
+        if (s is Screen.Inbox) inboxCountryKey = s.country.key
         screen = s
     }
 
@@ -109,7 +111,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (!silent) messages = Load.Loading
         refreshing = true
         try {
-            messages = Load.Done(Api.messages(number))
+            messages = Load.Done(Api.messages(number, inboxCountryKey))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
