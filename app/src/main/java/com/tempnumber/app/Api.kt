@@ -104,13 +104,12 @@ object Api {
                 is String -> Country(item, displayName(item), Flags.isoFor(item, item))
                 is JSONObject -> {
                     val name = item.firstString("name", "country", "country_name", "countryName", "title")
-                        ?: item.firstString("code", "iso", "iso2", "country_code", "countryCode")
-                    if (name == null) {
-                        null
-                    } else {
-                        val code = item.firstString("code", "iso", "iso2", "country_code", "countryCode", "slug", "id")
-                        Country(code ?: name, displayName(name), Flags.isoFor(name, code))
-                    }
+                    val id = item.firstString("id", "countryId", "country_id")
+                    val iso = item.firstString("code", "iso", "iso2", "country_code", "countryCode", "short_name", "shortName", "alpha2")
+                    val label = name ?: iso
+                    val key = id ?: iso ?: name
+                    if (label == null || key == null) null
+                    else Country(key, displayName(label), Flags.isoFor(label, iso))
                 }
                 else -> null
             }
@@ -119,10 +118,7 @@ object Api {
     }
 
     suspend fun numbers(country: Country): List<PhoneNumber> {
-        val reply = get(
-            BuildConfig.PATH_NUMBERS,
-            mapOf(BuildConfig.PARAM_COUNTRY to country.key.lowercase(), "page" to "1")
-        )
+        val reply = get(BuildConfig.PATH_NUMBERS, mapOf(BuildConfig.PARAM_COUNTRY to country.key))
         return items(reply).mapNotNull { item ->
             val n = when (item) {
                 is String -> item
@@ -134,7 +130,7 @@ object Api {
     }
 
     suspend fun messages(number: String): List<Sms> {
-        val reply = get(BuildConfig.PATH_MESSAGES, mapOf(BuildConfig.PARAM_NUMBER to prettyNumber(number)))
+        val reply = get(BuildConfig.PATH_MESSAGES, mapOf(BuildConfig.PARAM_NUMBER to number))
         return items(reply).mapNotNull { item ->
             when (item) {
                 is String -> Sms("", item, "")
