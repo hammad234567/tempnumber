@@ -90,18 +90,26 @@ object Api {
         return null
     }
 
+    /** If the API gives only a 2-letter code like "fi", show the full country name. */
+    private fun displayName(name: String): String =
+        if (name.length == 2 && name.all { it.isLetter() }) {
+            java.util.Locale("", name.uppercase()).displayCountry.ifBlank { name }
+        } else {
+            name
+        }
+
     suspend fun countries(): List<Country> {
         val list = items(get(BuildConfig.PATH_COUNTRIES)).mapNotNull { item ->
             when (item) {
-                is String -> Country(item, item, Flags.isoFor(item, null))
+                is String -> Country(item, displayName(item), Flags.isoFor(item, item))
                 is JSONObject -> {
                     val name = item.firstString("name", "country", "country_name", "countryName", "title")
-                        ?: item.firstString("code", "iso")
+                        ?: item.firstString("code", "iso", "iso2", "country_code", "countryCode")
                     if (name == null) {
                         null
                     } else {
                         val code = item.firstString("code", "iso", "iso2", "country_code", "countryCode", "slug", "id")
-                        Country(code ?: name, name, Flags.isoFor(name, code))
+                        Country(code ?: name, displayName(name), Flags.isoFor(name, code))
                     }
                 }
                 else -> null
@@ -111,7 +119,10 @@ object Api {
     }
 
     suspend fun numbers(country: Country): List<PhoneNumber> {
-        val reply = get(BuildConfig.PATH_NUMBERS, mapOf(BuildConfig.PARAM_COUNTRY to country.key))
+        val reply = get(
+            BuildConfig.PATH_NUMBERS,
+            mapOf(BuildConfig.PARAM_COUNTRY to country.key.lowercase(), "page" to "1")
+        )
         return items(reply).mapNotNull { item ->
             val n = when (item) {
                 is String -> item
@@ -123,7 +134,7 @@ object Api {
     }
 
     suspend fun messages(number: String): List<Sms> {
-        val reply = get(BuildConfig.PATH_MESSAGES, mapOf(BuildConfig.PARAM_NUMBER to number))
+        val reply = get(BuildConfig.PATH_MESSAGES, mapOf(BuildConfig.PARAM_NUMBER to prettyNumber(number)))
         return items(reply).mapNotNull { item ->
             when (item) {
                 is String -> Sms("", item, "")
