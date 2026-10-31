@@ -1,164 +1,140 @@
 package com.tempnumber.app
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.json.JSONArray
-import org.json.JSONObject
-import org.json.JSONTokener
-import java.util.concurrent.TimeUnit
+import android.app.Application
+import android.content.Context
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
+import java.io.IOException
 
-data class Country(val key: String, val name: String, val iso: String?)
-data class PhoneNumber(val number: String)
-data class Sms(val sender: String, val text: String, val time: String)
-data class SavedNumber(val countryKey: String, val countryName: String, val number: String) {
-    fun country() = Country(countryKey, countryName, Flags.isoFor(countryName, countryKey))
+sealed interface Load<out T> {
+    object Loading : Load<Nothing>
+    data class Failure(val message: String) : Load<Nothing>
+    data class Done<T>(val data: T) : Load<T>
 }
 
-class ApiException(message: String) : Exception(message)
+sealed interface Screen {
+    object Splash : Screen
+    object Home : Screen
+    object MyNumbers : Screen
+    data class Numbers(val country: Country) : Screen
+    data class Inbox(val country: Country, val number: String, val from: Screen) : Screen
+}
 
-object Api {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .build()
+private class SavedStore(context: Context) {
+    private val prefs = context.getSharedPreferences("saved_numbers", Context.MODE_PRIVATE)
 
-    private suspend fun get(path: String, params: Map<String, String> = emptyMap()): Any =
-        withContext(Dispatchers.IO) {
-            val url = "https://${BuildConfig.RAPIDAPI_HOST}$path".toHttpUrl().newBuilder().apply {
-                params.forEach { (k, v) -> addQueryParameter(k, v) }
-            }.build()
-            val request = Request.Builder()
-                .url(url)
-                .header("X-RapidAPI-Key", BuildConfig.RAPIDAPI_KEY)
-                .header("X-RapidAPI-Host", BuildConfig.RAPIDAPI_HOST)
-                .build()
-            client.newCall(request).execute().use { response ->
-                val body = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    throw ApiException("Server error ${response.code}: ${body.take(160)}")
-                }
-                try {
-                    JSONTokener(body).nextValue() ?: throw ApiException("Empty reply")
-                } catch (e: ApiException) {
-                    throw e
-                } catch (e: Exception) {
-                    throw ApiException("Unexpected reply: ${body.take(160)}")
-                }
-            }
+    fun all(): List<SavedNumber> =
+        prefs.getString("list", "").orEmpty().split("\n").mapNotNull { line ->
+            val f = line.split("\t")
+            if (f.size == 3) SavedNumber(f[0], f[1], f[2]) else null
         }
 
-    /** Finds the list of items in a reply, whatever the wrapper looks like. */
-    private fun items(v: Any?): List<Any> {
-        when (v) {
-            is JSONArray -> return (0 until v.length()).mapNotNull { v.opt(it) }
-            is JSONObject -> {
-                for (k in v.keys()) {
-                    val c = v.opt(k)
-                    if (c is JSONArray) return items(c)
-                }
-                for (k in v.keys()) {
-                    val c = v.opt(k)
-                    if (c is JSONObject) {
-                        for (k2 in c.keys()) {
-                            val d = c.opt(k2)
-                            if (d is JSONArray) return items(d)
-                        }
-                    }
-                }
-                val out = mutableListOf<Any>()
-                for (k in v.keys()) {
-                    val c = v.opt(k)
-                    if (c is String) out.add(JSONObject().put("code", k).put("name", c))
-                }
-                return out
-            }
-        }
-        return emptyList()
+    fun write(list: List<SavedNumber>) {
+        prefs.edit()
+            .putString("list", list.joinToString("\n") { "${it.countryKey}\t${it.countryName}\t${it.number}" })
+            .apply()
+    }
+}
+
+class AppViewModel(app: Application) : AndroidViewModel(app) {
+    private val store = SavedStore(app)
+    private var inboxCountryKey = ""
+
+    var screen by mutableStateOf<Screen>(Screen.Splash)
+        private set
+    var countries by mutableStateOf<Load<List<Country>>>(Load.Loading)
+        private set
+    var numbers by mutableStateOf<Load<List<PhoneNumber>>>(Load.Loading)
+        private set
+    var messages by mutableStateOf<Load<List<Sms>>>(Load.Loading)
+        private set
+    var refreshing by mutableStateOf(false)
+        private set
+    var saved by mutableStateOf(store.all())
+        private set
+
+    init {
+        loadCountries()
     }
 
-    private fun JSONObject.firstString(vararg keys: String): String? {
-        for (k in keys) {
-            val v = opt(k)
-            if (v != null && v != JSONObject.NULL) {
-                val s = v.toString().trim()
-                if (s.isNotEmpty()) return s
-            }
-        }
-        return null
+    fun go(s: Screen) {
+        if (s is Screen.Inbox) inboxCountryKey = s.country.key
+        screen = s
     }
 
-    /** If the API gives only a 2-letter code like "fi", show the full country name. */
-    private fun displayName(name: String): String =
-        if (name.length == 2 && name.all { it.isLetter() }) {
-            java.util.Locale("", name.uppercase()).displayCountry.ifBlank { name }
+    fun back() {
+        screen = when (val s = screen) {
+            is Screen.Numbers -> Screen.Home
+            is Screen.Inbox -> s.from
+            Screen.MyNumbers -> Screen.Home
+            else -> screen
+        }
+    }
+
+    private fun friendly(e: Exception): String = when (e) {
+        is IOException -> "No internet connection. Check your network and try again."
+        else -> e.message ?: "Something went wrong."
+    }
+
+    fun loadCountries() {
+        countries = Load.Loading
+        viewModelScope.launch {
+            countries = try {
+                Load.Done(Api.countries())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Load.Failure(friendly(e))
+            }
+        }
+    }
+
+    fun loadNumbers(country: Country) {
+        numbers = Load.Loading
+        viewModelScope.launch {
+            numbers = try {
+                Load.Done(Api.numbers(country))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Load.Failure(friendly(e))
+            }
+        }
+    }
+
+    suspend fun refreshMessages(number: String, silent: Boolean) {
+        if (!silent) messages = Load.Loading
+        refreshing = true
+        try {
+            messages = Load.Done(Api.messages(number, inboxCountryKey))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val keepOld = silent && messages is Load.Done
+            if (!keepOld) messages = Load.Failure(friendly(e))
+        } finally {
+            refreshing = false
+        }
+    }
+
+    fun isSaved(number: String) = saved.any { it.number == number }
+
+    fun toggleSaved(country: Country, number: String) {
+        saved = if (isSaved(number)) {
+            saved.filterNot { it.number == number }
         } else {
-            name
+            listOf(SavedNumber(country.key, country.name, number)) + saved
         }
-
-    suspend fun countries(): List<Country> {
-        val list = items(get(BuildConfig.PATH_COUNTRIES)).mapNotNull { item ->
-            when (item) {
-                is String -> Country(item, displayName(item), Flags.isoFor(item, item))
-                is JSONObject -> {
-                    val name = item.firstString("name", "country", "country_name", "countryName", "title")
-                    val id = item.firstString("id", "countryId", "country_id")
-                    val iso = item.firstString("code", "iso", "iso2", "country_code", "countryCode", "short_name", "shortName", "alpha2")
-                    val label = name ?: iso
-                    val key = id ?: iso ?: name
-                    if (label == null || key == null) null
-                    else Country(key, displayName(label), Flags.isoFor(label, iso))
-                }
-                else -> null
-            }
-        }
-        return list.distinctBy { it.key }.sortedBy { it.name }
+        store.write(saved)
     }
 
-    suspend fun numbers(country: Country): List<PhoneNumber> {
-        val reply = get(BuildConfig.PATH_NUMBERS, mapOf(BuildConfig.PARAM_COUNTRY to country.key))
-        return items(reply).mapNotNull { item ->
-            val n = when (item) {
-                is String -> item
-                is JSONObject -> item.firstString("number", "phone", "phone_number", "phoneNumber", "msisdn", "full_number")
-                else -> null
-            }
-            n?.let { PhoneNumber(it) }
-        }.distinctBy { it.number }
-    }
-
-    suspend fun messages(number: String): List<Sms> {
-        val reply = get(BuildConfig.PATH_MESSAGES, mapOf(BuildConfig.PARAM_NUMBER to number))
-        return items(reply).mapNotNull { item ->
-            when (item) {
-                is String -> Sms("", item, "")
-                is JSONObject -> {
-                    val text = item.firstString("text", "message", "body", "content", "sms", "msg")
-                    if (text == null) {
-                        null
-                    } else {
-                        Sms(
-                            sender = item.firstString("from", "sender", "source", "originator") ?: "",
-                            text = text,
-                            time = item.firstString("time", "date", "received", "received_at", "created_at", "createdAt", "timestamp", "age") ?: ""
-                        )
-                    }
-                }
-                else -> null
-            }
-        }
+    fun removeSaved(item: SavedNumber) {
+        saved = saved.filterNot { it.number == item.number }
+        store.write(saved)
     }
 }
-
-private val codeRegex = Regex("""(?<!\d)(\d{3}[- ]\d{3}|\d{4,8})(?!\d)""")
-
-/** Pulls the verification code (4 to 8 digits) out of an SMS text. */
-fun extractCode(text: String): String? =
-    codeRegex.find(text)?.value?.filter { it.isDigit() }
-
-fun groupCode(code: String): String =
-    if (code.length == 6) "${code.take(3)} ${code.drop(3)}" else code
-
-fun prettyNumber(n: String): String = if (n.isNotEmpty() && n.all { it.isDigit() }) "+$n" else n
